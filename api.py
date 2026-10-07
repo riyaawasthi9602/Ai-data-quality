@@ -1,22 +1,50 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-import pandas as pd
-import numpy as np
+import hashlib
 import os
 import shutil
-import joblib
-import json
-import hashlib
+import tempfile
 
-from tensorflow.keras.models import load_model
+import pandas as pd
 
+from src.quality import analyze_quality
 from src.drift import detect_drift
-from src.anomaly import prepare_data
 
+from src.anomaly import AutoencoderAnomalyDetector
+
+from src.isolation_forest import (
+    IsolationForestAnomalyDetector,
+    IsolationForestConfig,
+)
+
+from src.ensemble import (
+    EnsembleAnomalyDetector,
+    EnsembleConfig,
+)
+
+from src.explainability import AnomalyExplainer
+from src.recommendation import RecommendationEngine
+from src.health_score import DataHealthScore
+
+from src.monitoring import (
+    HistoricalMonitor,
+    MonitoringConfig,
+)
+
+
+# =========================================================
+# FASTAPI APPLICATION
+# =========================================================
 
 app = FastAPI(
-    title="AI Data Quality & Drift Detection"
+    title="AI Data Quality & Drift Detection Platform",
+    description=(
+        "AI-based enterprise data quality, drift detection, "
+        "anomaly detection, explainability, recommendations "
+        "and historical data health monitoring platform."
+    ),
+    version="1.0.0",
 )
 
 
@@ -45,82 +73,31 @@ os.makedirs(BASELINE_DIR, exist_ok=True)
 
 
 # =========================================================
-# EXISTING AI MODEL
-# =========================================================
-
-MODEL_PATH = "models/autoencoder.keras"
-SCALER_PATH = "models/scaler.pkl"
-
-model = load_model(MODEL_PATH)
-scaler = joblib.load(SCALER_PATH)
-
-
-# =========================================================
-# HOME
+# HOME ENDPOINT
 # =========================================================
 
 @app.get("/")
 def home():
-
     return {
-        "message": "AI Data Quality API is running"
+        "message": (
+            "AI Data Quality & Drift Detection API is running"
+        ),
+        "version": "1.0.0",
+        "status": "healthy",
     }
 
 
 # =========================================================
-# DATA QUALITY
+# HEALTH ENDPOINT
 # =========================================================
 
-def calculate_quality(df):
-
-    total_cells = df.shape[0] * df.shape[1]
-
-    missing_cells = int(
-        df.isnull().sum().sum()
-    )
-
-    missing_percentage = (
-        missing_cells / total_cells
-    ) * 100 if total_cells > 0 else 0
-
-    duplicate_rows = int(
-        df.duplicated().sum()
-    )
-
-    duplicate_percentage = (
-        duplicate_rows / len(df)
-    ) * 100 if len(df) > 0 else 0
-
-    missing_score = max(
-        0,
-        100 - missing_percentage
-    )
-
-    duplicate_score = max(
-        0,
-        100 - duplicate_percentage
-    )
-
-    quality_score = (
-        missing_score * 0.6 +
-        duplicate_score * 0.4
-    )
-
+@app.get("/health")
+def api_health():
     return {
-        "score": round(
-            float(quality_score),
-            2
+        "status": "healthy",
+        "service": (
+            "AI Data Quality & Drift Detection Platform"
         ),
-        "missing_values": missing_cells,
-        "missing_percentage": round(
-            float(missing_percentage),
-            2
-        ),
-        "duplicate_rows": duplicate_rows,
-        "duplicate_percentage": round(
-            float(duplicate_percentage),
-            2
-        )
     }
 
 
@@ -128,7 +105,12 @@ def calculate_quality(df):
 # DATASET ID
 # =========================================================
 
-def create_dataset_id(df):
+def create_dataset_id(
+    df: pd.DataFrame,
+) -> str:
+    """
+    Create a stable dataset ID from the dataset schema.
+    """
 
     schema = "|".join(
         [
@@ -138,7 +120,7 @@ def create_dataset_id(df):
     )
 
     return hashlib.md5(
-        schema.encode()
+        schema.encode("utf-8")
     ).hexdigest()[:12]
 
 
@@ -146,179 +128,541 @@ def create_dataset_id(df):
 # BASELINE PATH
 # =========================================================
 
-def get_baseline_path(dataset_id):
+def get_baseline_path(
+    dataset_id: str,
+) -> str:
 
     return os.path.join(
         BASELINE_DIR,
-        f"{dataset_id}.csv"
+        f"{dataset_id}.csv",
     )
 
 
 # =========================================================
-# AI ANOMALY DETECTION
+# SAVE UPLOADED FILE
 # =========================================================
 
-def detect_ai_anomalies(df, baseline_df):
-
-    current_data = prepare_data(df)
-    baseline_data = prepare_data(baseline_df)
-
-    common_columns = [
-        column
-        for column in baseline_data.columns
-        if column in current_data.columns
-    ]
-
-    if len(common_columns) == 0:
-
-        return {
-            "error": "No compatible numerical features found."
-        }
-
-    current_data = current_data[
-        common_columns
-    ]
-
-    baseline_data = baseline_data[
-        common_columns
-    ]
-
-    # Check model compatibility
-
-    if (
-        current_data.shape[1]
-        != scaler.n_features_in_
-    ):
-
-        return {
-            "error":
-                "Dataset schema is incompatible with "
-                "the currently trained AI model.",
-            "expected_features":
-                int(scaler.n_features_in_),
-            "received_features":
-                int(current_data.shape[1]),
-            "features":
-                list(current_data.columns)
-        }
-
-    # Scale data
-
-    X_current = scaler.transform(
-        current_data
-    )
-
-    X_baseline = scaler.transform(
-        baseline_data
-    )
-
-    # Current reconstruction
-
-    reconstructed_current = model.predict(
-        X_current,
-        verbose=0
-    )
-
-    current_error = np.mean(
-        np.square(
-            X_current -
-            reconstructed_current
-        ),
-        axis=1
-    )
-
-    # Baseline reconstruction
-
-    reconstructed_baseline = model.predict(
-        X_baseline,
-        verbose=0
-    )
-
-    baseline_error = np.mean(
-        np.square(
-            X_baseline -
-            reconstructed_baseline
-        ),
-        axis=1
-    )
-
-    # Threshold
-
-    threshold = np.percentile(
-        baseline_error,
-        95
-    )
-
-    anomalies = (
-        current_error >
-        threshold
-    )
-
-    anomaly_count = int(
-        anomalies.sum()
-    )
-
-    anomaly_percentage = (
-        anomaly_count /
-        len(anomalies)
-    ) * 100 if len(anomalies) > 0 else 0
-
-    return {
-
-        "anomalies":
-            anomaly_count,
-
-        "percentage":
-            round(
-                float(anomaly_percentage),
-                2
-            ),
-
-        "threshold":
-            float(threshold)
-    }
-
-
-# =========================================================
-# ANALYZE DATASET
-# =========================================================
-
-@app.post("/analyze")
-async def analyze_dataset(
-
-    file: UploadFile = File(...),
-
-    dataset_name: str = Form(
-        "default_dataset"
-    )
-):
-
-    # -----------------------------------------------------
-    # Save uploaded file
-    # -----------------------------------------------------
+def save_uploaded_file(
+    file: UploadFile,
+) -> str:
+    """
+    Save the uploaded CSV safely inside uploads/.
+    """
 
     safe_filename = os.path.basename(
-        file.filename
+        file.filename or "uploaded.csv"
     )
 
     file_path = os.path.join(
         UPLOAD_DIR,
-        safe_filename
+        safe_filename,
     )
 
     with open(
         file_path,
-        "wb"
+        "wb",
     ) as buffer:
 
         shutil.copyfileobj(
             file.file,
-            buffer
+            buffer,
         )
 
-    # -----------------------------------------------------
-    # Read dataset
-    # -----------------------------------------------------
+    return file_path
+
+
+# =========================================================
+# DATASET INFORMATION
+# =========================================================
+
+def get_dataset_info(
+    df: pd.DataFrame,
+) -> dict:
+
+    return {
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "column_names": list(df.columns),
+    }
+
+
+# =========================================================
+# RUN COMPLETE AI ANALYSIS
+# =========================================================
+
+def run_ai_analysis(
+    reference_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+) -> dict:
+    """
+    Run the complete analysis pipeline:
+
+    Quality
+        ↓
+    Drift
+        ↓
+    Autoencoder
+        ↓
+    Isolation Forest
+        ↓
+    Ensemble
+        ↓
+    Explainability
+        ↓
+    Recommendations
+        ↓
+    Health Score
+        ↓
+    Historical Monitoring
+    """
+
+    # =====================================================
+    # TEMPORARY FILES
+    # =====================================================
+
+    reference_temp = tempfile.NamedTemporaryFile(
+        suffix=".csv",
+        delete=False,
+    )
+
+    current_temp = tempfile.NamedTemporaryFile(
+        suffix=".csv",
+        delete=False,
+    )
+
+    reference_temp.close()
+    current_temp.close()
+
+    reference_path = reference_temp.name
+    current_path = current_temp.name
+
+    try:
+
+        # -------------------------------------------------
+        # Save DataFrames temporarily
+        # -------------------------------------------------
+
+        reference_df.to_csv(
+            reference_path,
+            index=False,
+        )
+
+        current_df.to_csv(
+            current_path,
+            index=False,
+        )
+
+        # =================================================
+        # 1. ADVANCED DATA QUALITY
+        # =================================================
+
+        quality_result = analyze_quality(
+            reference_path,
+        )
+
+        # =================================================
+        # 2. ADVANCED DRIFT DETECTION
+        # =================================================
+
+        drift_result = detect_drift(
+            reference_path,
+            current_path,
+        )
+
+        # =================================================
+        # 3. AUTOENCODER
+        # =================================================
+
+        autoencoder = (
+            AutoencoderAnomalyDetector()
+        )
+
+        autoencoder.load()
+
+        autoencoder_result = (
+            autoencoder.predict(
+                current_df,
+            )
+        )
+
+        # =================================================
+        # 4. ISOLATION FOREST
+        # =================================================
+
+        isolation_forest = (
+            IsolationForestAnomalyDetector(
+                config=IsolationForestConfig(
+                    n_estimators=200,
+                    contamination=0.05,
+                ),
+                exclude_columns=[
+                    "Patient Number"
+                ],
+            )
+        )
+
+        isolation_forest.load()
+
+        isolation_result = (
+            isolation_forest.predict(
+                current_df,
+            )
+        )
+
+        # =================================================
+        # 5. ENSEMBLE ANOMALY DETECTION
+        # =================================================
+
+        ensemble = (
+            EnsembleAnomalyDetector(
+                EnsembleConfig(
+                    autoencoder_weight=0.5,
+                    isolation_forest_weight=0.5,
+                    threshold=0.5,
+                )
+            )
+        )
+
+        ensemble_result = (
+            ensemble.predict(
+
+                autoencoder_result[
+                    "results"
+                ][
+                    "reconstruction_error"
+                ].values,
+
+                isolation_result[
+                    "results"
+                ][
+                    "isolation_score"
+                ].values,
+
+                autoencoder_result[
+                    "results"
+                ][
+                    "is_anomaly"
+                ].values,
+
+                isolation_result[
+                    "results"
+                ][
+                    "is_anomaly"
+                ].values,
+            )
+        )
+
+        # =================================================
+        # 6. EXPLAINABILITY
+        # =================================================
+
+        explainer = AnomalyExplainer()
+
+        explanations = (
+            explainer.explain_dataset(
+                reference_df=reference_df,
+                current_df=current_df,
+                ensemble_result=ensemble_result,
+                only_anomalies=True,
+            )
+        )
+
+        # -------------------------------------------------
+        # API RESPONSE LIMIT
+        # -------------------------------------------------
+        #
+        # We still calculate ALL explanations internally.
+        # Only a limited number are returned through the API
+        # to prevent huge Swagger/browser responses.
+        #
+
+        MAX_EXPLANATIONS_IN_RESPONSE = 10
+
+        top_explanations = explanations[
+            :MAX_EXPLANATIONS_IN_RESPONSE
+        ]
+
+        # =================================================
+        # 7. RECOMMENDATION ENGINE
+        # =================================================
+
+        recommendation_engine = (
+            RecommendationEngine()
+        )
+
+        recommendation_result = (
+            recommendation_engine
+            .generate_recommendations(
+                quality_result=quality_result,
+                drift_result=drift_result,
+                anomaly_result=ensemble_result,
+                explanations=explanations,
+            )
+        )
+
+        # =================================================
+        # 8. DATA HEALTH SCORE
+        # =================================================
+
+        health_calculator = (
+            DataHealthScore()
+        )
+
+        health_result = (
+            health_calculator
+            .calculate_health_score(
+                quality_result=quality_result,
+                drift_result=drift_result,
+                anomaly_result=ensemble_result,
+            )
+        )
+
+        # =================================================
+        # 9. HISTORICAL MONITORING
+        # =================================================
+
+        monitor = HistoricalMonitor(
+            MonitoringConfig(
+                history_path=(
+                    "data/analysis_history.json"
+                )
+            )
+        )
+
+        monitoring_result = (
+            monitor.record_run(
+                result={
+                    "quality": quality_result,
+                    "drift": drift_result,
+                    "ensemble": ensemble_result,
+                    "health_score": health_result,
+                    "recommendations": (
+                        recommendation_result
+                    ),
+                },
+                reference_path=reference_path,
+                current_path=current_path,
+            )
+        )
+
+        # =================================================
+        # 10. RETURN COMPLETE RESULT
+        # =================================================
+
+        return {
+
+            # -------------------------------------------------
+            # DATA QUALITY
+            # -------------------------------------------------
+
+            "data_quality": quality_result,
+
+            # -------------------------------------------------
+            # DRIFT
+            # -------------------------------------------------
+
+            "drift": drift_result,
+
+            # -------------------------------------------------
+            # AUTOENCODER
+            # -------------------------------------------------
+
+            "autoencoder": {
+                "anomaly_count": (
+                    autoencoder_result[
+                        "anomaly_count"
+                    ]
+                ),
+
+                "anomaly_percentage": (
+                    autoencoder_result[
+                        "anomaly_percentage"
+                    ]
+                ),
+
+                "threshold": (
+                    autoencoder_result[
+                        "threshold"
+                    ]
+                ),
+            },
+
+            # -------------------------------------------------
+            # ISOLATION FOREST
+            # -------------------------------------------------
+
+            "isolation_forest": {
+                "anomaly_count": (
+                    isolation_result[
+                        "anomaly_count"
+                    ]
+                ),
+
+                "anomaly_percentage": (
+                    isolation_result[
+                        "anomaly_percentage"
+                    ]
+                ),
+            },
+
+            # -------------------------------------------------
+            # ENSEMBLE
+            # -------------------------------------------------
+
+            "ensemble": {
+
+                "anomaly_count": (
+                    ensemble_result[
+                        "anomaly_count"
+                    ]
+                ),
+
+                "anomaly_percentage": (
+                    ensemble_result[
+                        "anomaly_percentage"
+                    ]
+                ),
+
+                "strong_anomaly_count": (
+                    ensemble_result[
+                        "strong_anomaly_count"
+                    ]
+                ),
+
+                "possible_anomaly_count": (
+                    ensemble_result[
+                        "possible_anomaly_count"
+                    ]
+                ),
+
+                "agreement_percentage": (
+                    ensemble_result[
+                        "agreement_percentage"
+                    ]
+                ),
+            },
+
+            # -------------------------------------------------
+            # EXPLAINABILITY
+            # -------------------------------------------------
+
+            "explainability": {
+
+                # Total number of anomalies explained
+                "explained_anomalies": len(
+                    explanations
+                ),
+
+                # Number actually returned to API client
+                "returned_explanations": len(
+                    top_explanations
+                ),
+
+                # Only first 10 are sent to browser
+                "explanations": top_explanations,
+            },
+
+            # -------------------------------------------------
+            # RECOMMENDATIONS
+            # -------------------------------------------------
+
+            "recommendations": (
+                recommendation_result
+            ),
+
+            # -------------------------------------------------
+            # HEALTH SCORE
+            # -------------------------------------------------
+
+            "health_score": health_result,
+
+            # -------------------------------------------------
+            # HISTORICAL MONITORING
+            # -------------------------------------------------
+
+            "monitoring": monitoring_result,
+        }
+
+    finally:
+
+        # =================================================
+        # CLEAN TEMPORARY FILES
+        # =================================================
+
+        if os.path.exists(
+            reference_path
+        ):
+
+            os.remove(
+                reference_path
+            )
+
+        if os.path.exists(
+            current_path
+        ):
+
+            os.remove(
+                current_path
+            )
+
+
+# =========================================================
+# ANALYZE DATASET ENDPOINT
+# =========================================================
+
+@app.post("/analyze")
+async def analyze_dataset(
+    file: UploadFile = File(...),
+    dataset_name: str = Form(
+        "default_dataset"
+    ),
+):
+
+    # =====================================================
+    # 1. VALIDATE FILE
+    # =====================================================
+
+    if not file.filename:
+
+        return {
+            "status": "ERROR",
+            "message": "No file was provided.",
+        }
+
+    if not file.filename.lower().endswith(
+        ".csv"
+    ):
+
+        return {
+            "status": "ERROR",
+            "message": (
+                "Only CSV files are supported."
+            ),
+        }
+
+    # =====================================================
+    # 2. SAVE UPLOADED FILE
+    # =====================================================
+
+    try:
+
+        file_path = (
+            save_uploaded_file(file)
+        )
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "message": (
+                f"Unable to save uploaded file: "
+                f"{str(exc)}"
+            ),
+        }
+
+    # =====================================================
+    # 3. READ CSV
+    # =====================================================
 
     try:
 
@@ -326,35 +670,49 @@ async def analyze_dataset(
             file_path
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         return {
-            "error":
-                f"Unable to read CSV: {str(e)}"
+            "status": "ERROR",
+            "message": (
+                f"Unable to read CSV: "
+                f"{str(exc)}"
+            ),
         }
 
-    # -----------------------------------------------------
-    # Dataset ID
-    # -----------------------------------------------------
+    # =====================================================
+    # 4. EMPTY DATASET CHECK
+    # =====================================================
+
+    if df.empty:
+
+        return {
+            "status": "ERROR",
+            "message": (
+                "Uploaded dataset is empty."
+            ),
+        }
+
+    # =====================================================
+    # 5. DATASET ID
+    # =====================================================
 
     dataset_id = create_dataset_id(
         df
     )
 
-    baseline_path = get_baseline_path(
-        dataset_id
+    baseline_path = (
+        get_baseline_path(
+            dataset_id
+        )
     )
 
-    # -----------------------------------------------------
-    # DATA QUALITY
-    # -----------------------------------------------------
-
-    quality = calculate_quality(
-        df
+    dataset_info = (
+        get_dataset_info(df)
     )
 
     # =====================================================
-    # FIRST UPLOAD
+    # 6. FIRST UPLOAD
     # =====================================================
 
     if not os.path.exists(
@@ -363,180 +721,221 @@ async def analyze_dataset(
 
         df.to_csv(
             baseline_path,
-            index=False
+            index=False,
         )
 
         return {
 
-            "filename":
-                file.filename,
+            "filename": file.filename,
 
-            "dataset_name":
-                dataset_name,
+            "dataset_name": dataset_name,
 
-            "dataset": {
+            "dataset_id": dataset_id,
 
-                "rows":
-                    len(df),
-
-                "columns":
-                    len(df.columns),
-
-                "column_names":
-                    list(df.columns)
-            },
-
-            "data_quality":
-                quality,
+            "dataset": dataset_info,
 
             "baseline": {
 
-                "created":
-                    True,
+                "created": True,
 
-                "message":
-                    "Baseline created successfully."
+                "message": (
+                    "Baseline created successfully. "
+                    "Future uploads with the same schema "
+                    "will be compared against this baseline."
+                ),
             },
 
-            "drift": {
-
-                "status":
-                    "NOT_AVAILABLE",
-
-                "percentage":
-                    0,
-
-                "columns":
-                    []
-            },
-
-            "ai_anomaly": {
-
-                "status":
-                    "BASELINE_CREATED",
-
-                "message":
-                    "AI anomaly detection will be performed on subsequent uploads."
-            },
-
-            "status":
+            "status": (
                 "BASELINE_CREATED"
+            ),
         }
 
     # =====================================================
-    # FUTURE UPLOAD
+    # 7. LOAD EXISTING BASELINE
     # =====================================================
 
-    baseline_df = pd.read_csv(
-        baseline_path
+    try:
+
+        baseline_df = pd.read_csv(
+            baseline_path
+        )
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "message": (
+                f"Unable to read baseline: "
+                f"{str(exc)}"
+            ),
+        }
+
+    # =====================================================
+    # 8. RUN COMPLETE AI ANALYSIS
+    # =====================================================
+
+    try:
+
+        analysis_result = (
+            run_ai_analysis(
+                reference_df=baseline_df,
+                current_df=df,
+            )
+        )
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "message": (
+                f"Analysis failed: "
+                f"{str(exc)}"
+            ),
+        }
+
+    # =====================================================
+    # 9. DETERMINE OVERALL STATUS
+    # =====================================================
+
+    health_result = (
+        analysis_result[
+            "health_score"
+        ]
     )
 
-    # -----------------------------------------------------
-    # DRIFT
-    # -----------------------------------------------------
-
-    drift_results, drift_percentage = (
-        detect_drift(
-            baseline_path,
-            file_path
+    health_level = (
+        health_result.get(
+            "health_level"
         )
     )
 
-    # -----------------------------------------------------
-    # AI ANOMALY
-    # -----------------------------------------------------
+    if health_level == "EXCELLENT":
 
-    ai_result = detect_ai_anomalies(
-        df,
-        baseline_df
-    )
+        status = "GOOD"
 
-    # -----------------------------------------------------
-    # STATUS
-    # -----------------------------------------------------
-
-    if "error" in ai_result:
+    elif health_level in (
+        "GOOD",
+        "NEEDS ATTENTION",
+    ):
 
         status = "WARNING"
 
     else:
 
-        anomaly_percentage = (
-            ai_result["percentage"]
-        )
-
-        if (
-            anomaly_percentage < 5
-            and drift_percentage < 10
-        ):
-
-            status = "GOOD"
-
-        elif (
-            anomaly_percentage < 15
-            and drift_percentage < 30
-        ):
-
-            status = "WARNING"
-
-        else:
-
-            status = "CRITICAL"
+        status = "CRITICAL"
 
     # =====================================================
-    # RESPONSE
+    # 10. FINAL RESPONSE
     # =====================================================
 
     return {
 
-        "filename":
-            file.filename,
+        "filename": file.filename,
 
-        "dataset_name":
-            dataset_name,
+        "dataset_name": dataset_name,
 
-        "dataset": {
+        "dataset_id": dataset_id,
 
-            "rows":
-                len(df),
-
-            "columns":
-                len(df.columns),
-
-            "column_names":
-                list(df.columns)
-        },
-
-        "data_quality":
-            quality,
+        "dataset": dataset_info,
 
         "baseline": {
 
-            "created":
-                False,
+            "created": False,
 
-            "message":
-                "Existing baseline used for analysis."
+            "message": (
+                "Existing baseline used "
+                "for analysis."
+            ),
         },
 
-        "drift": {
+        # -------------------------------------------------
+        # DATA QUALITY
+        # -------------------------------------------------
 
-            "status":
-                "ANALYZED",
+        "data_quality": (
+            analysis_result[
+                "data_quality"
+            ]
+        ),
 
-            "percentage":
-                round(
-                    float(drift_percentage),
-                    2
-                ),
+        # -------------------------------------------------
+        # DRIFT
+        # -------------------------------------------------
 
-            "columns":
-                drift_results
+        "drift": (
+            analysis_result[
+                "drift"
+            ]
+        ),
+
+        # -------------------------------------------------
+        # ANOMALY DETECTION
+        # -------------------------------------------------
+
+        "anomaly_detection": {
+
+            "autoencoder": (
+                analysis_result[
+                    "autoencoder"
+                ]
+            ),
+
+            "isolation_forest": (
+                analysis_result[
+                    "isolation_forest"
+                ]
+            ),
+
+            "ensemble": (
+                analysis_result[
+                    "ensemble"
+                ]
+            ),
         },
 
-        "ai_anomaly":
-            ai_result,
+        # -------------------------------------------------
+        # EXPLAINABILITY
+        # -------------------------------------------------
 
-        "status":
-            status
+        "explainability": (
+            analysis_result[
+                "explainability"
+            ]
+        ),
+
+        # -------------------------------------------------
+        # RECOMMENDATIONS
+        # -------------------------------------------------
+
+        "recommendations": (
+            analysis_result[
+                "recommendations"
+            ]
+        ),
+
+        # -------------------------------------------------
+        # HEALTH SCORE
+        # -------------------------------------------------
+
+        "health_score": (
+            analysis_result[
+                "health_score"
+            ]
+        ),
+
+        # -------------------------------------------------
+        # MONITORING
+        # -------------------------------------------------
+
+        "monitoring": (
+            analysis_result[
+                "monitoring"
+            ]
+        ),
+
+        # -------------------------------------------------
+        # OVERALL STATUS
+        # -------------------------------------------------
+
+        "status": status,
     }
